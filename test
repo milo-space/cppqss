@@ -1,0 +1,104 @@
+import pymxs # type: ignore
+from pymxs import runtime as rt # type: ignore
+
+from PySide2.QtWidgets import *
+from PySide2.QtGui import *
+from PySide2.QtCore import *
+
+import uuid
+
+MAX_WINDOW = QWidget.find(rt.windows.getMaxHWND())
+
+class MaxMaterialButton(QWidget):
+
+    material_changed = Signal(object)
+
+    @property
+    def material(self):
+        return self._mat_button.material
+    
+    @material.setter
+    def material(self, material):
+        self._mat_button.material = material
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+
+        self.setAcceptDrops(True)
+        self.setContentsMargins(0,0,0,0)
+        self._layout = QVBoxLayout(self)
+        self._layout.setContentsMargins(0,0,0,0)
+
+        button_height = 24
+
+        self.setMinimumHeight(button_height)
+        self.setMaximumHeight(button_height)
+
+        self._before_mat = None
+
+        widget_id = str(uuid.uuid4()).replace("-", "_")
+        
+        max_exp = f'''
+            rollout mtbtn "{widget_id}"(
+                materialButton matButton "" align:#left pos:[0,0]
+            )
+            createdialog mtbtn width:0 height:{button_height}
+            cui.RegisterDialogBar mtbtn
+        '''
+        rt.execute(max_exp)
+
+        self._mat_button = rt.mtbtn.matButton
+
+        mat_button_widget = MAX_WINDOW.findChild(QDockWidget, widget_id)
+
+        self._mat_widget = None
+
+        try:
+            self._mat_widget:QWidget = mat_button_widget.children()[5]
+            self._mat_widget.setContentsMargins(0,0,0,0)
+            self._layout.addWidget(self._mat_widget)
+        except:
+            raise RuntimeError("Material Button Widget not found.")
+        
+        finally:
+            mat_button_widget.deleteLater()
+
+        self._update_caption()
+
+        """タイマー"""
+        self._timer = QTimer(self)
+        self._timer.setInterval(100)
+        self._timer.timeout.connect(self._on_timeout)
+        self._timer.start()
+
+        rt.mtbtn = None
+
+
+    def _update_caption(self):
+        self._mat_button.caption = f"{self.material.name if self.material else 'None'}"
+        self._resize_button(self.size())
+
+    def _on_timeout(self, *args):
+
+        if self.material == self._before_mat:
+            return
+        
+        self._update_caption()
+        
+        self._before_mat = self.material
+        self.material_changed.emit(self.material)
+
+
+    def resizeEvent(self, event:QResizeEvent):
+        self._resize_button(event.size())
+        return super().resizeEvent(event)
+    
+
+    def _resize_button(self, size:QSize):
+
+        scale = self.screen().logicalDotsPerInch() / 96.0
+
+        self._mat_button.width = size.width() / scale
+        self._mat_button.height = size.height() / scale
+        if self._mat_widget:
+            self._mat_widget.setGeometry(0, 0, size.width(), size.height())
