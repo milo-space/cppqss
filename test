@@ -1,104 +1,64 @@
-import pymxs # type: ignore
-from pymxs import runtime as rt # type: ignore
+import pymxs
+from typing import Tuple
 
-from PySide2.QtWidgets import *
-from PySide2.QtGui import *
-from PySide2.QtCore import *
-
-import uuid
-
-MAX_WINDOW = QWidget.find(rt.windows.getMaxHWND())
-
-class MaxMaterialButton(QWidget):
-
-    material_changed = Signal(object)
-
-    @property
-    def material(self):
-        return self._mat_button.material
-    
-    @material.setter
-    def material(self, material):
-        self._mat_button.material = material
-
-    def __init__(self, parent=None):
-        super().__init__(parent)
-
-        self.setAcceptDrops(True)
-        self.setContentsMargins(0,0,0,0)
-        self._layout = QVBoxLayout(self)
-        self._layout.setContentsMargins(0,0,0,0)
-
-        button_height = 24
-
-        self.setMinimumHeight(button_height)
-        self.setMaximumHeight(button_height)
-
-        self._before_mat = None
-
-        widget_id = str(uuid.uuid4()).replace("-", "_")
-        
-        max_exp = f'''
-            rollout mtbtn "{widget_id}"(
-                materialButton matButton "" align:#left pos:[0,0]
-            )
-            createdialog mtbtn width:0 height:{button_height}
-            cui.RegisterDialogBar mtbtn
-        '''
-        rt.execute(max_exp)
-
-        self._mat_button = rt.mtbtn.matButton
-
-        mat_button_widget = MAX_WINDOW.findChild(QDockWidget, widget_id)
-
-        self._mat_widget = None
-
-        try:
-            self._mat_widget:QWidget = mat_button_widget.children()[5]
-            self._mat_widget.setContentsMargins(0,0,0,0)
-            self._layout.addWidget(self._mat_widget)
-        except:
-            raise RuntimeError("Material Button Widget not found.")
-        
-        finally:
-            mat_button_widget.deleteLater()
-
-        self._update_caption()
-
-        """タイマー"""
-        self._timer = QTimer(self)
-        self._timer.setInterval(100)
-        self._timer.timeout.connect(self._on_timeout)
-        self._timer.start()
-
-        rt.mtbtn = None
+rt = pymxs.runtime
 
 
-    def _update_caption(self):
-        self._mat_button.caption = f"{self.material.name if self.material else 'None'}"
-        self._resize_button(self.size())
+def print_selected_node_as_ue_fmatrix() -> None:
+    selection_count = rt.selection.count
 
-    def _on_timeout(self, *args):
+    if selection_count != 1:
+        print("ノードを1つだけ選択してください。")
+        print(f"現在の選択数: {selection_count}")
+        return
 
-        if self.material == self._before_mat:
-            return
-        
-        self._update_caption()
-        
-        self._before_mat = self.material
-        self.material_changed.emit(self.material)
+    node = rt.selection[0]
+    tm = node.transform
+
+    a, b, c = float(tm.row1.x), float(tm.row1.y), float(tm.row1.z)
+    d, e, f = float(tm.row2.x), float(tm.row2.y), float(tm.row2.z)
+    g, h, i = float(tm.row3.x), float(tm.row3.y), float(tm.row3.z)
+    x, y, z = float(tm.row4.x), float(tm.row4.y), float(tm.row4.z)
+
+    x_plane: Tuple[float, float, float, float] = (a, -b, c, 0.0)
+    y_plane: Tuple[float, float, float, float] = (-d, e, -f, 0.0)
+    z_plane: Tuple[float, float, float, float] = (g, -h, i, 0.0)
+    w_plane: Tuple[float, float, float, float] = (x, -y, z, 1.0)
+
+    def print_plane(name: str, plane: Tuple[float, float, float, float]) -> None:
+        px, py, pz, pw = plane
+        print(
+            f"{name}=FPlane("
+            f"X={px:.2f}, Y={py:.2f}, Z={pz:.2f}, W={pw:.2f}"
+            f")"
+        )
+
+    print("----- 3dsMax -> UE FMatrix -----")
+    print(f"Node: {node.name}")
+    print("Conversion: position [X, Y, Z] -> [X, -Y, Z]")
+    print("Rotation/Scale: R_ue = C * R_max * C, C = diag(1, -1, 1)")
+    print("")
+
+    print_plane("XPlane", x_plane)
+    print_plane("YPlane", y_plane)
+    print_plane("ZPlane", z_plane)
+    print_plane("WPlane", w_plane)
+    print("")
+
+    print("FMatrix M(")
+    print(
+        f"    FPlane({x_plane[0]:.2f}, {x_plane[1]:.2f}, {x_plane[2]:.2f}, {x_plane[3]:.2f}),"
+    )
+    print(
+        f"    FPlane({y_plane[0]:.2f}, {y_plane[1]:.2f}, {y_plane[2]:.2f}, {y_plane[3]:.2f}),"
+    )
+    print(
+        f"    FPlane({z_plane[0]:.2f}, {z_plane[1]:.2f}, {z_plane[2]:.2f}, {z_plane[3]:.2f}),"
+    )
+    print(
+        f"    FPlane({w_plane[0]:.2f}, {w_plane[1]:.2f}, {w_plane[2]:.2f}, {w_plane[3]:.2f})"
+    )
+    print(");")
 
 
-    def resizeEvent(self, event:QResizeEvent):
-        self._resize_button(event.size())
-        return super().resizeEvent(event)
-    
-
-    def _resize_button(self, size:QSize):
-
-        scale = self.screen().logicalDotsPerInch() / 96.0
-
-        self._mat_button.width = size.width() / scale
-        self._mat_button.height = size.height() / scale
-        if self._mat_widget:
-            self._mat_widget.setGeometry(0, 0, size.width(), size.height())
+print_selected_node_as_ue_fmatrix()
