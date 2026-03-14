@@ -1,0 +1,283 @@
+import pymxs # type: ignore
+from pymxs import runtime as rt # type: ignore
+
+from PySide2.QtWidgets import *
+from PySide2.QtGui import *
+from PySide2.QtCore import *
+
+import uuid
+
+MAX_WINDOW = QWidget.find(rt.windows.getMaxHWND())
+
+class MaterialButton(QPushButton):
+
+    material_changed = Signal(object)
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+
+        self._material = None
+        
+        self._place_holder_text = ""
+
+        self._menu = QMenu(self)
+
+        self._menu.aboutToShow.connect(self._update_menu_actions)
+
+        self.action_set_from_sme = self._menu.addAction("SME選択から設定")
+        self.action_set_from_dialog = self._menu.addAction("マテリアル ブラウザから設定...")
+        self._menu.addSeparator()
+        self.action_view_at_sme = self._menu.addAction("SMEで表示...")
+        self._menu.addSeparator()
+        self.action_clear = self._menu.addAction("クリア")
+
+        self.action_set_from_dialog.triggered.connect(self._on_action_set_from_dialog)
+        self.action_set_from_sme.triggered.connect(self._on_action_set_from_sme)
+        self.action_view_at_sme.triggered.connect(self._on_action_view_at_sme)
+        self.action_clear.triggered.connect(self._on_action_clear)
+
+        self.setMenu(self._menu)
+
+        self._update_text()
+
+
+    def _update_menu_actions(self):
+        sme_material = self._get_first_selected_sme_material()
+
+        if rt.superClassOf(sme_material) == rt.Material:
+            self.action_set_from_sme.setEnabled(True)
+            self.action_set_from_sme.setText(f"SME選択： {sme_material.name} ({rt.classof(sme_material).localizedName})")
+
+        else:
+            self.action_set_from_sme.setEnabled(False)
+            self.action_set_from_sme.setText(f"SME選択： 未選択")
+
+        self._menu.setMinimumWidth(0)
+        self._menu.setMaximumWidth(600)
+
+        self._menu.ensurePolished()
+
+        content_width = self._menu.sizeHint().width()
+        button_width = self.width()
+
+        target_width = max(button_width, content_width)
+
+        self._menu.setFixedWidth(target_width)
+
+
+    def _on_action_set_from_dialog(self):
+        material = rt.materialBrowseDlg(rt.name("mats"), rt.name("instanceOnly"))
+        if rt.superClassOf(material) == rt.Material:
+            self.set_material(material)
+
+
+    def _get_first_selected_sme_material(self):
+        """
+        SME のアクティブビューで現在選択されているノードのうち、
+        最初に見つかった Material を返します。
+
+        Returns:
+            object | None:
+                Material が見つかればそのオブジェクト、なければ None
+        """
+        if not rt.sme.IsOpen():
+            return None
+
+        view_index = rt.sme.activeView
+        if view_index <= 0:
+            return None
+
+        view = rt.sme.GetView(view_index)
+        if view is None:
+            return None
+
+        selected_nodes = view.GetSelectedNodes()
+        if selected_nodes is None or selected_nodes.count == 0:
+            return None
+
+        for node in selected_nodes:
+            if not rt.isProperty(node, "reference"):
+                continue
+
+            ref_obj = node.reference
+            if ref_obj is None:
+                continue
+
+            if rt.superClassOf(ref_obj) == rt.material:
+                return ref_obj
+
+        return None
+
+
+    def _on_action_set_from_sme(self):
+        material = self._get_first_selected_sme_material()
+        
+        if material is not None:
+            self.set_material(material)
+
+
+    def _on_action_view_at_sme(self):
+        def show_material_in_sme(
+            material,
+            view_name: str = "View1",
+            node_position_x: int = 0,
+            node_position_y: int = 0,
+        ) -> bool:
+            """
+            Slate Material Editor(SME) 上で指定 Material を表示し、
+            選択状態にして Parameter Editor にも表示します。
+
+            挙動:
+                - SME が閉じていれば開く
+                - 有効な View がなければ作成する
+                - 既に View 上にノードがあれば再利用する
+                - なければ新規ノードを作成する
+                - ノードを選択し、選択ノードへズームする
+                - Parameter Editor に material を表示する
+
+            Args:
+                material:
+                    表示したい 3ds Max の Material オブジェクト
+                view_name:
+                    View が存在しない場合に作成する View 名
+                node_position_x:
+                    新規ノード作成時の X 座標
+                node_position_y:
+                    新規ノード作成時の Y 座標
+
+            Returns:
+                bool:
+                    表示に成功した場合 True、失敗した場合 False
+            """
+            if material is None:
+                return False
+
+            if rt.superClassOf(material) != rt.material:
+                return False
+
+            if not rt.sme.IsOpen():
+                rt.sme.Open()
+
+            view_index = rt.sme.activeView
+
+            if view_index <= 0:
+                existing_index = rt.sme.GetViewByName(view_name)
+                if existing_index is not None and existing_index > 0:
+                    view_index = existing_index
+                else:
+                    view_index = rt.sme.CreateView(view_name)
+
+                rt.sme.activeView = view_index
+
+            view = rt.sme.GetView(view_index)
+            if view is None:
+                return False
+
+            node = view.GetNodeByRef(material)
+
+            if node is None:
+                pos = rt.point2(node_position_x, node_position_y)
+                node = view.CreateNode(material, pos)
+
+            if node is None:
+                return False
+
+            view.SetSelectedNodes(rt.Array(material))
+            rt.sme.SetMtlInParamEditor(material)
+            view.ZoomExtents(type=rt.name("selected"))
+
+            return True
+        
+        show_material_in_sme(self._material)
+
+
+    def _on_action_clear(self):
+        self.clear_material()
+
+
+    def _update_text(self):
+        if self._material is None:
+            if self._place_holder_text == "":
+                self.setText("マテリアルを選択")
+                self.action_clear.setEnabled(False)
+                self.action_view_at_sme.setEnabled(False)
+            else:
+                self.setText(self._place_holder_text)
+                self.action_clear.setEnabled(True)
+                self.action_view_at_sme.setEnabled(False)
+        else:
+            self.setText(f"{self._material.name} ({rt.classof(self._material).localizedName})")
+            self.action_clear.setEnabled(True)
+            self.action_view_at_sme.setEnabled(True)
+
+    """
+    パブリック メソッド
+    """
+
+    def set_place_holder_text(self, text:str):
+        self._place_holder_text = text
+
+    def material(self):
+        return self._material
+    
+
+    def init_material(self, material):
+
+        if material is not None and rt.superClassOf(material) != rt.Material:
+            raise ValueError("The provided object is not a material.")
+
+        self._material = material
+        self._update_text()
+    
+
+    def set_material(self, material):
+
+        if material is not None and rt.superClassOf(material) != rt.Material:
+            raise ValueError("The provided object is not a material.")
+
+        if self._material == material:
+            self._update_text()
+            return
+        
+        self._material = material
+        self.material_changed.emit(material)
+        self._update_text()
+
+
+    def clear_material(self):
+        self.set_material(None)
+
+
+
+class TestWindow(QMainWindow):
+    def __init__(self, parent=MAX_WINDOW):
+        super().__init__(parent)
+
+        self._layout = QVBoxLayout()
+        self._content = QWidget()
+        self._content.setLayout(self._layout)
+        self.setCentralWidget(self._content)
+        
+        map_button = MaterialButton()
+        map_button.clear_material()
+
+        self._layout.addWidget(map_button)
+
+        button = QPushButton("プリント")
+        
+
+        def print_map():
+            print(map_button.material)
+
+        button.clicked.connect(print_map)
+
+        self._layout.addWidget(button)
+
+
+def main():
+    window = TestWindow()
+    window.show()
+    window.setFixedWidth(300)
+
+if __name__ == "__main__":
+    main()
