@@ -1,283 +1,823 @@
-import pymxs # type: ignore
-from pymxs import runtime as rt # type: ignore
-
-from PySide2.QtWidgets import *
-from PySide2.QtGui import *
-from PySide2.QtCore import *
-
-import uuid
-
-MAX_WINDOW = QWidget.find(rt.windows.getMaxHWND())
-
-class MaterialButton(QPushButton):
-
-    material_changed = Signal(object)
-
-    def __init__(self, parent=None):
-        super().__init__(parent)
-
-        self._material = None
-        
-        self._place_holder_text = ""
-
-        self._menu = QMenu(self)
-
-        self._menu.aboutToShow.connect(self._update_menu_actions)
-
-        self.action_set_from_sme = self._menu.addAction("SME選択から設定")
-        self.action_set_from_dialog = self._menu.addAction("マテリアル ブラウザから設定...")
-        self._menu.addSeparator()
-        self.action_view_at_sme = self._menu.addAction("SMEで表示...")
-        self._menu.addSeparator()
-        self.action_clear = self._menu.addAction("クリア")
-
-        self.action_set_from_dialog.triggered.connect(self._on_action_set_from_dialog)
-        self.action_set_from_sme.triggered.connect(self._on_action_set_from_sme)
-        self.action_view_at_sme.triggered.connect(self._on_action_view_at_sme)
-        self.action_clear.triggered.connect(self._on_action_clear)
-
-        self.setMenu(self._menu)
-
-        self._update_text()
+from collections import deque
+from heapq import heappush, heappop
 
 
-    def _update_menu_actions(self):
-        sme_material = self._get_first_selected_sme_material()
+def update_progress(progress: int) -> None:
+    pass
 
-        if rt.superClassOf(sme_material) == rt.Material:
-            self.action_set_from_sme.setEnabled(True)
-            self.action_set_from_sme.setText(f"SME選択： {sme_material.name} ({rt.classof(sme_material).localizedName})")
 
+def pair(
+    data_a: dict[tuple[int, ...], object],
+    data_b: dict[tuple[int, ...], object],
+) -> tuple[list[tuple[object, object]], list[object], list[object]]:
+    update_progress(0)
+
+    keys_a = sorted(data_a.keys())
+    keys_b = sorted(data_b.keys())
+    n = len(keys_a)
+    m = len(keys_b)
+
+    if n == 0 or m == 0:
+        update_progress(100)
+        return [], [data_a[k] for k in keys_a], [data_b[k] for k in keys_b]
+
+    # --- reverse index ---
+    int_to_bs: dict[int, list[int]] = {}
+    for j, kb in enumerate(keys_b):
+        for v in kb:
+            int_to_bs.setdefault(v, []).append(j)
+
+    # --- common item computation ---
+    common_cnt: list[dict[int, int]] = [dict() for _ in range(n)]
+    common_min: list[dict[int, int]] = [dict() for _ in range(n)]
+    for i, ka in enumerate(keys_a):
+        hits: dict[int, list[int]] = {}
+        for v in ka:
+            for j in int_to_bs.get(v, ()):
+                hits.setdefault(j, []).append(v)
+        for j, vals in hits.items():
+            common_cnt[i][j] = len(vals)
+            common_min[i][j] = min(vals)
+
+    update_progress(5)
+
+    # ============================
+    # Pass1: MCMF for tier1 + tier2 optimal matching
+    # ============================
+    max_pairs = min(n, m)
+    BASE_2 = max_pairs + 1
+    max_len = max(
+        max((len(ka) for ka in keys_a), default=1),
+        max((len(kb) for kb in keys_b), default=1),
+    )
+    pow2 = [1] * (max_len + 1)
+    for c in range(1, max_len + 1):
+        pow2[c] = pow2[c - 1] * BASE_2
+    TIER1 = pow2[-1] * BASE_2
+
+    INF = float('inf')
+
+    # Network: S=0, A_i=i+1 (i=0..n-1), B_j=n+1+j (j=0..m-1), T=n+m+1
+    S = 0
+    T = n + m + 1
+    V = T + 1
+
+    # Edge storage: edges[k] = [to, cap, cost, rev_index]
+    edges: list[list] = []
+    g: list[list[int]] = [[] for _ in range(V)]
+
+    def add_edge(u: int, v: int, cap: int, cost: int) -> None:
+        g[u].append(len(edges))
+        edges.append([v, cap, cost, len(edges) + 1])
+        g[v].append(len(edges))
+        edges.append([u, 0, -cost, len(edges) - 1])
+
+    # S -> A_i (cap=1, cost=0)
+    for i in range(n):
+        add_edge(S, i + 1, 1, 0)
+
+    # A_i -> B_j (cap=1, cost=w)
+    for i in range(n):
+        for j, cnt in common_cnt[i].items():
+            w = -(cnt * TIER1 + pow2[cnt])
+            add_edge(i + 1, n + 1 + j, 1, w)
+
+    # B_j -> T (cap=1, cost=0)
+    for j in range(m):
+        add_edge(n + 1 + j, T, 1, 0)
+
+    update_progress(10)
+
+    # MCMF: Successive shortest paths
+    h = [0] * V  # Johnson potentials
+    dist = [0] * V
+    prev_v = [0] * V
+    prev_e = [0] * V
+    _edges = edges
+    _g = g
+    _h = h
+    _dist = dist
+
+    # First iteration: SPFA (handles negative costs)
+    def spfa() -> bool:
+        for i in range(V):
+            _dist[i] = INF
+        _dist[S] = 0
+        in_q = bytearray(V)
+        dq: deque[int] = deque([S])
+        in_q[S] = 1
+        while dq:
+            u = dq.popleft()
+            in_q[u] = 0
+            du = _dist[u]
+            for idx in _g[u]:
+                e = _edges[idx]
+                if e[1] > 0:
+                    v = e[0]
+                    nd = du + e[2]
+                    if nd < _dist[v]:
+                        _dist[v] = nd
+                        prev_v[v] = u
+                        prev_e[v] = idx
+                        if not in_q[v]:
+                            if dq and nd <= _dist[dq[0]]:
+                                dq.appendleft(v)
+                            else:
+                                dq.append(v)
+                            in_q[v] = 1
+        return _dist[T] < INF
+
+    # Subsequent iterations: Dijkstra with Johnson potentials
+    def dijkstra() -> bool:
+        for i in range(V):
+            _dist[i] = INF
+        _dist[S] = 0
+        pq: list[tuple[int, int]] = [(0, S)]
+        while pq:
+            d, u = heappop(pq)
+            if d > _dist[u]:
+                continue
+            hu = _h[u]
+            for idx in _g[u]:
+                e = _edges[idx]
+                if e[1] > 0:
+                    v = e[0]
+                    nd = d + e[2] + hu - _h[v]
+                    if nd < _dist[v]:
+                        _dist[v] = nd
+                        prev_v[v] = u
+                        prev_e[v] = idx
+                        heappush(pq, (nd, v))
+        return _dist[T] < INF
+
+    total_flow = 0
+    total_cost = 0
+    first = True
+
+    while True:
+        if first:
+            found = spfa()
+            first = False
         else:
-            self.action_set_from_sme.setEnabled(False)
-            self.action_set_from_sme.setText(f"SME選択： 未選択")
+            found = dijkstra()
+        if not found:
+            break
+        # Check marginal cost: actual path cost = dist[T] + h[T] - h[S]
+        marginal = dist[T] + h[T] - h[S]
+        if marginal >= 0:
+            break
+        # Update potentials
+        for i in range(V):
+            if dist[i] < INF:
+                h[i] += dist[i]
+        # Augment along shortest path
+        v = T
+        while v != S:
+            e_idx = prev_e[v]
+            edges[e_idx][1] -= 1
+            edges[edges[e_idx][3]][1] += 1
+            v = prev_v[v]
+        total_flow += 1
+        total_cost += h[T] - h[S]
+        update_progress(min(10 + 40 * total_flow // max_pairs, 50))
 
-        self._menu.setMinimumWidth(0)
-        self._menu.setMaximumWidth(600)
+    # Extract matching
+    match_a = [-1] * n
+    match_b = [-1] * m
+    matched_count = 0
+    for i in range(n):
+        for idx in g[i + 1]:
+            e = edges[idx]
+            if e[0] > n and e[0] <= n + m and e[1] == 0:
+                j = e[0] - n - 1
+                match_a[i] = j
+                match_b[j] = i
+                matched_count += 1
+                break
 
-        self._menu.ensurePolished()
+    update_progress(50)
 
-        content_width = self._menu.sizeHint().width()
-        button_width = self.width()
+    if matched_count == 0:
+        update_progress(100)
+        return [], list(data_a.values()), list(data_b.values())
 
-        target_width = max(button_width, content_width)
+    # --- tier12-optimal subgraph via SCC on rc=0 residual graph ---
+    # Use MCMF potentials h[] directly for reduced cost computation
+    V_scc = n + m + 2
+    S_scc = 0
+    T_scc = V_scc - 1
+    scc_adj: list[list[int]] = [[] for _ in range(V_scc)]
 
-        self._menu.setFixedWidth(target_width)
-
-
-    def _on_action_set_from_dialog(self):
-        material = rt.materialBrowseDlg(rt.name("mats"), rt.name("instanceOnly"))
-        if rt.superClassOf(material) == rt.Material:
-            self.set_material(material)
-
-
-    def _get_first_selected_sme_material(self):
-        """
-        SME のアクティブビューで現在選択されているノードのうち、
-        最初に見つかった Material を返します。
-
-        Returns:
-            object | None:
-                Material が見つかればそのオブジェクト、なければ None
-        """
-        if not rt.sme.IsOpen():
-            return None
-
-        view_index = rt.sme.activeView
-        if view_index <= 0:
-            return None
-
-        view = rt.sme.GetView(view_index)
-        if view is None:
-            return None
-
-        selected_nodes = view.GetSelectedNodes()
-        if selected_nodes is None or selected_nodes.count == 0:
-            return None
-
-        for node in selected_nodes:
-            if not rt.isProperty(node, "reference"):
+    # rc=0 unmatched forward edges: A_i -> B_j
+    rc0_fwd: list[list[int]] = [[] for _ in range(n)]
+    for i in range(n):
+        hi = h[i + 1]
+        for j, cnt in common_cnt[i].items():
+            if match_a[i] == j:
                 continue
+            ecost = -(cnt * TIER1 + pow2[cnt])
+            rc = ecost + hi - h[n + 1 + j]
+            if rc == 0:
+                rc0_fwd[i].append(j)
+                scc_adj[i + 1].append(n + 1 + j)
 
-            ref_obj = node.reference
-            if ref_obj is None:
-                continue
+    # rc=0 matched reverse edges: B_j -> A_i (always rc=0 for matched)
+    for j in range(m):
+        if match_b[j] >= 0:
+            scc_adj[n + 1 + j].append(match_b[j] + 1)
 
-            if rt.superClassOf(ref_obj) == rt.material:
-                return ref_obj
+    # S <-> A edges: rc = 0 + h[from] - h[to]
+    for i in range(n):
+        if match_a[i] >= 0:
+            if h[i + 1] == h[S]:
+                scc_adj[i + 1].append(S_scc)
+        else:
+            if h[S] == h[i + 1]:
+                scc_adj[S_scc].append(i + 1)
 
-        return None
+    # B <-> T edges
+    for j in range(m):
+        if match_b[j] >= 0:
+            if h[T] == h[n + 1 + j]:
+                scc_adj[T_scc].append(n + 1 + j)
+        else:
+            if h[n + 1 + j] == h[T]:
+                scc_adj[n + 1 + j].append(T_scc)
 
+    # Iterative Tarjan's SCC
+    scc_cnt = [0]
+    scc_stk: list[int] = []
+    scc_on: list[bool] = [False] * V_scc
+    scc_low: list[int] = [0] * V_scc
+    scc_num: list[int] = [-1] * V_scc
+    scc_id: list[int] = [-1] * V_scc
 
-    def _on_action_set_from_sme(self):
-        material = self._get_first_selected_sme_material()
-        
-        if material is not None:
-            self.set_material(material)
-
-
-    def _on_action_view_at_sme(self):
-        def show_material_in_sme(
-            material,
-            view_name: str = "View1",
-            node_position_x: int = 0,
-            node_position_y: int = 0,
-        ) -> bool:
-            """
-            Slate Material Editor(SME) 上で指定 Material を表示し、
-            選択状態にして Parameter Editor にも表示します。
-
-            挙動:
-                - SME が閉じていれば開く
-                - 有効な View がなければ作成する
-                - 既に View 上にノードがあれば再利用する
-                - なければ新規ノードを作成する
-                - ノードを選択し、選択ノードへズームする
-                - Parameter Editor に material を表示する
-
-            Args:
-                material:
-                    表示したい 3ds Max の Material オブジェクト
-                view_name:
-                    View が存在しない場合に作成する View 名
-                node_position_x:
-                    新規ノード作成時の X 座標
-                node_position_y:
-                    新規ノード作成時の Y 座標
-
-            Returns:
-                bool:
-                    表示に成功した場合 True、失敗した場合 False
-            """
-            if material is None:
-                return False
-
-            if rt.superClassOf(material) != rt.material:
-                return False
-
-            if not rt.sme.IsOpen():
-                rt.sme.Open()
-
-            view_index = rt.sme.activeView
-
-            if view_index <= 0:
-                existing_index = rt.sme.GetViewByName(view_name)
-                if existing_index is not None and existing_index > 0:
-                    view_index = existing_index
-                else:
-                    view_index = rt.sme.CreateView(view_name)
-
-                rt.sme.activeView = view_index
-
-            view = rt.sme.GetView(view_index)
-            if view is None:
-                return False
-
-            node = view.GetNodeByRef(material)
-
-            if node is None:
-                pos = rt.point2(node_position_x, node_position_y)
-                node = view.CreateNode(material, pos)
-
-            if node is None:
-                return False
-
-            view.SetSelectedNodes(rt.Array(material))
-            rt.sme.SetMtlInParamEditor(material)
-            view.ZoomExtents(type=rt.name("selected"))
-
-            return True
-        
-        show_material_in_sme(self._material)
-
-
-    def _on_action_clear(self):
-        self.clear_material()
-
-
-    def _update_text(self):
-        if self._material is None:
-            if self._place_holder_text == "":
-                self.setText("マテリアルを選択")
-                self.action_clear.setEnabled(False)
-                self.action_view_at_sme.setEnabled(False)
+    def _tarjan_iter(start: int) -> None:
+        call_stk: list[tuple[int, int]] = [(start, 0)]
+        scc_num[start] = scc_low[start] = scc_cnt[0]
+        scc_cnt[0] += 1
+        scc_stk.append(start)
+        scc_on[start] = True
+        while call_stk:
+            u_t, ei = call_stk[-1]
+            if ei < len(scc_adj[u_t]):
+                call_stk[-1] = (u_t, ei + 1)
+                v_t = scc_adj[u_t][ei]
+                if scc_num[v_t] == -1:
+                    scc_num[v_t] = scc_low[v_t] = scc_cnt[0]
+                    scc_cnt[0] += 1
+                    scc_stk.append(v_t)
+                    scc_on[v_t] = True
+                    call_stk.append((v_t, 0))
+                elif scc_on[v_t]:
+                    if scc_num[v_t] < scc_low[u_t]:
+                        scc_low[u_t] = scc_num[v_t]
             else:
-                self.setText(self._place_holder_text)
-                self.action_clear.setEnabled(True)
-                self.action_view_at_sme.setEnabled(False)
+                if scc_low[u_t] == scc_num[u_t]:
+                    cid = u_t
+                    while True:
+                        w_t = scc_stk.pop()
+                        scc_on[w_t] = False
+                        scc_id[w_t] = cid
+                        if w_t == u_t:
+                            break
+                call_stk.pop()
+                if call_stk:
+                    parent = call_stk[-1][0]
+                    if scc_low[u_t] < scc_low[parent]:
+                        scc_low[parent] = scc_low[u_t]
+
+    for u_t in range(V_scc):
+        if scc_num[u_t] == -1:
+            _tarjan_iter(u_t)
+
+    opt_adj: list[list[int]] = [[] for _ in range(n)]
+    opt_min: list[dict[int, int]] = [dict() for _ in range(n)]
+
+    # All matched edges are always tier12-optimal
+    for i in range(n):
+        j = match_a[i]
+        if j >= 0 and j in common_min[i]:
+            opt_adj[i].append(j)
+            opt_min[i][j] = common_min[i][j]
+
+    # Unmatched rc=0 edges: tier12-optimal iff same SCC
+    for i in range(n):
+        for j in rc0_fwd[i]:
+            if scc_id[i + 1] == scc_id[n + 1 + j]:
+                opt_adj[i].append(j)
+                opt_min[i][j] = common_min[i][j]
+
+    update_progress(55)
+
+    # ============================
+    # Pass2: Lex-min sorted min_val list via greedy with incremental matching
+    # ============================
+
+    edge_cost: list[dict[int, int]] = [dict() for _ in range(n)]
+    for i in range(n):
+        for j in opt_adj[i]:
+            cnt = common_cnt[i][j]
+            edge_cost[i][j] = -(cnt * TIER1 + pow2[cnt])
+
+    opt_total_cost = 0
+    from collections import Counter
+    opt_cnt_dist = Counter()
+    for i in range(n):
+        j = match_a[i]
+        if j >= 0 and j in edge_cost[i]:
+            opt_total_cost += edge_cost[i][j]
+            opt_cnt_dist[common_cnt[i][j]] += 1
+
+    # Collect all tier12-optimal edges sorted by min_val
+    edges_by_mv: list[tuple[int, int, int]] = []
+    for i in range(n):
+        for j in opt_adj[i]:
+            edges_by_mv.append((opt_min[i][j], i, j))
+    edges_by_mv.sort()
+
+    # Build reverse adjacency for opt subgraph
+    opt_radj: list[list[int]] = [[] for _ in range(m)]
+    for i in range(n):
+        for j in opt_adj[i]:
+            opt_radj[j].append(i)
+
+    # Initialize matching from Pass1
+    cur_ma = [-1] * n
+    cur_mb = [-1] * m
+    cur_match_size = 0
+    for i in range(n):
+        j = match_a[i]
+        if j >= 0 and j in opt_min[i]:
+            cur_ma[i] = j
+            cur_mb[j] = i
+            cur_match_size += 1
+
+    avail_a = bytearray(n)
+    avail_b = bytearray(m)
+    for i in range(n):
+        avail_a[i] = 1
+    for j in range(m):
+        avail_b[j] = 1
+
+    needed = 0  # will be set in loop
+
+    def _is_feasible(fix_i: int, fix_j: int) -> bool:
+        j_partner = cur_ma[fix_i]
+        i_partner = cur_mb[fix_j]
+
+        if j_partner == fix_j:
+            return True
+        losses = (1 if j_partner >= 0 else 0) + (1 if i_partner >= 0 else 0)
+        if losses == 0:
+            return True
+        if cur_match_size - losses >= needed:
+            return True
+        recover_needed = needed - (cur_match_size - losses)
+        recovered = 0
+        if j_partner >= 0:
+            if _has_aug_from_b(j_partner, fix_i, fix_j):
+                recovered += 1
+                if recovered >= recover_needed:
+                    return True
+        if i_partner >= 0 and recovered < recover_needed:
+            if _has_aug_from_a(i_partner, fix_i, fix_j):
+                recovered += 1
+                if recovered >= recover_needed:
+                    return True
+        return False
+
+    def _has_aug_from_b(free_j: int, skip_i: int, skip_j: int) -> bool:
+        visited_a = bytearray(n)
+        q = deque()
+        for i in opt_radj[free_j]:
+            if i == skip_i or not avail_a[i] or visited_a[i]:
+                continue
+            visited_a[i] = 1
+            if cur_ma[i] == -1 or cur_ma[i] == skip_j:
+                return True
+            q.append(i)
+        while q:
+            a_node = q.popleft()
+            j2 = cur_ma[a_node]
+            if j2 == skip_j:
+                return True
+            if not avail_b[j2]:
+                continue
+            for i in opt_radj[j2]:
+                if i == skip_i or not avail_a[i] or visited_a[i]:
+                    continue
+                visited_a[i] = 1
+                if cur_ma[i] == -1 or cur_ma[i] == skip_j:
+                    return True
+                q.append(i)
+        return False
+
+    def _has_aug_from_a(free_i: int, skip_i: int, skip_j: int) -> bool:
+        visited_b = bytearray(m)
+        q = deque()
+        for j in opt_adj[free_i]:
+            if j == skip_j or not avail_b[j] or visited_b[j]:
+                continue
+            visited_b[j] = 1
+            if cur_mb[j] == -1 or cur_mb[j] == skip_i:
+                return True
+            q.append(j)
+        while q:
+            b_node = q.popleft()
+            i2 = cur_mb[b_node]
+            if i2 == skip_i:
+                return True
+            if not avail_a[i2]:
+                continue
+            for j in opt_adj[i2]:
+                if j == skip_j or not avail_b[j] or visited_b[j]:
+                    continue
+                visited_b[j] = 1
+                if cur_mb[j] == -1 or cur_mb[j] == skip_i:
+                    return True
+                q.append(j)
+        return False
+
+    def _do_aug_from_b(free_j: int) -> bool:
+        prev_a = [-1] * n
+        visited_a = bytearray(n)
+        q = deque()
+        target_a = -1
+        for i in opt_radj[free_j]:
+            if not avail_a[i] or visited_a[i]:
+                continue
+            visited_a[i] = 1
+            prev_a[i] = free_j
+            if cur_ma[i] == -1:
+                target_a = i
+                break
+            q.append(i)
+        if target_a == -1:
+            while q:
+                a_node = q.popleft()
+                j2 = cur_ma[a_node]
+                if not avail_b[j2]:
+                    continue
+                for i in opt_radj[j2]:
+                    if not avail_a[i] or visited_a[i]:
+                        continue
+                    visited_a[i] = 1
+                    prev_a[i] = j2
+                    if cur_ma[i] == -1:
+                        target_a = i
+                        break
+                    q.append(i)
+                if target_a != -1:
+                    break
+        if target_a == -1:
+            return False
+        i = target_a
+        while i != -1:
+            j = prev_a[i]
+            old_i = cur_mb[j] if j != free_j else -1
+            cur_ma[i] = j
+            cur_mb[j] = i
+            i = old_i
+        return True
+
+    # cnt distribution tracking
+    max_c_val = max(opt_cnt_dist.keys()) if opt_cnt_dist else 0
+    rd_arr = [0] * (max_c_val + 1)
+    for c, cnt in opt_cnt_dist.items():
+        rd_arr[c] = cnt
+
+    def _commit_edge(fix_i: int, fix_j: int) -> None:
+        nonlocal cur_match_size
+        lost_b = -1
+        lost_a = -1
+        if cur_ma[fix_i] == fix_j:
+            cur_ma[fix_i] = -1
+            cur_mb[fix_j] = -1
+            cur_match_size -= 1
         else:
-            self.setText(f"{self._material.name} ({rt.classof(self._material).localizedName})")
-            self.action_clear.setEnabled(True)
-            self.action_view_at_sme.setEnabled(True)
+            if cur_ma[fix_i] >= 0:
+                lost_b = cur_ma[fix_i]
+                cur_mb[lost_b] = -1
+                cur_ma[fix_i] = -1
+                cur_match_size -= 1
+            if cur_mb[fix_j] >= 0:
+                lost_a = cur_mb[fix_j]
+                cur_ma[lost_a] = -1
+                cur_mb[fix_j] = -1
+                cur_match_size -= 1
+        avail_a[fix_i] = 0
+        avail_b[fix_j] = 0
+        if lost_b >= 0 and avail_b[lost_b]:
+            if _do_aug_from_b(lost_b):
+                cur_match_size += 1
+        if lost_a >= 0 and avail_a[lost_a] and cur_ma[lost_a] == -1:
+            recovered_a = False
+            for j2 in opt_adj[lost_a]:
+                if avail_b[j2] and cur_mb[j2] == -1:
+                    cur_ma[lost_a] = j2
+                    cur_mb[j2] = lost_a
+                    cur_match_size += 1
+                    recovered_a = True
+                    break
+            if not recovered_a:
+                visited_b2 = bytearray(m)
+                prev_b2 = [-1] * m
+                q2 = deque()
+                target_j2 = -1
+                for j2 in opt_adj[lost_a]:
+                    if not avail_b[j2] or visited_b2[j2]:
+                        continue
+                    visited_b2[j2] = 1
+                    prev_b2[j2] = lost_a
+                    if cur_mb[j2] == -1:
+                        target_j2 = j2
+                        break
+                    q2.append(j2)
+                if target_j2 == -1:
+                    while q2:
+                        b_node2 = q2.popleft()
+                        i2 = cur_mb[b_node2]
+                        if not avail_a[i2]:
+                            continue
+                        for j2 in opt_adj[i2]:
+                            if not avail_b[j2] or visited_b2[j2]:
+                                continue
+                            visited_b2[j2] = 1
+                            prev_b2[j2] = i2
+                            if cur_mb[j2] == -1:
+                                target_j2 = j2
+                                break
+                            q2.append(j2)
+                        if target_j2 != -1:
+                            break
+                if target_j2 != -1:
+                    j2 = target_j2
+                    while j2 != -1:
+                        i2 = prev_b2[j2]
+                        old_j2 = cur_ma[i2] if i2 != lost_a else -1
+                        cur_ma[i2] = j2
+                        cur_mb[j2] = i2
+                        j2 = old_j2
+                    cur_match_size += 1
+        c_fix = common_cnt[fix_i][fix_j]
+        rd_arr[c_fix] -= 1
 
-    """
-    パブリック メソッド
-    """
+    fixed: list[tuple[int, int]] = []
+    num_edges = len(edges_by_mv)
+    _sim_budget = [0]  # remaining recursive calls permitted in simulation
 
-    def set_place_holder_text(self, text:str):
-        self._place_holder_text = text
+    def _greedy_fill(remaining: int, es: int,
+                     record: list | None,
+                     upper_bound: list[int] | None = None) -> list[int] | None:
+        """Fast greedy continuation — pick the first feasible edge at each
+        position without any tie-breaking recursion.  Used as fallback when
+        the simulation budget is exhausted.
 
-    def material(self):
-        return self._material
-    
+        Supports *upper_bound* for early termination: if the greedy result
+        cannot beat the bound, returns ``None`` immediately without
+        traversing all remaining positions.
+        """
+        nonlocal cur_match_size, needed
+        result: list[int] = []
+        pos = 0
+        while remaining > 0:
+            needed = remaining - 1
+            while es < num_edges:
+                mv, i, j = edges_by_mv[es]
+                if not avail_a[i] or not avail_b[j]:
+                    es += 1
+                    continue
+                c = common_cnt[i][j]
+                if c > max_c_val or rd_arr[c] <= 0:
+                    es += 1
+                    continue
+                break
+            found = False
+            for eidx in range(es, num_edges):
+                mv, i, j = edges_by_mv[eidx]
+                if not avail_a[i] or not avail_b[j]:
+                    continue
+                c = common_cnt[i][j]
+                if c > max_c_val or rd_arr[c] <= 0:
+                    continue
+                if needed > 0 and not _is_feasible(i, j):
+                    continue
+                # --- early termination against upper_bound ---
+                if upper_bound is not None:
+                    if pos < len(upper_bound):
+                        if mv > upper_bound[pos]:
+                            return None  # worse at this position → prune
+                        elif mv < upper_bound[pos]:
+                            upper_bound = None  # strictly better → stop checking
+                    else:
+                        upper_bound = None  # more values → strictly better
+                result.append(mv)
+                _commit_edge(i, j)
+                if record is not None:
+                    record.append((i, j))
+                found = True
+                pos += 1
+                break
+            if not found:
+                break
+            remaining -= 1
+        # If bound still active, we didn't beat it (equal or shorter).
+        if upper_bound is not None:
+            return None
+        return result
 
-    def init_material(self, material):
+    def _select_greedy(remaining: int, es: int, record: list | None,
+                       upper_bound: list[int] | None = None) -> list[int] | None:
+        """Recursively select edges producing the lex-min min_val sequence.
 
-        if material is not None and rt.superClassOf(material) != rt.Material:
-            raise ValueError("The provided object is not a material.")
+        At each position, the smallest feasible min_val is mandatory (lex-min).
+        When multiple edges share that min_val (tie), every candidate is tried:
+        we commit each, recursively solve the remaining sub-problem, and keep
+        the candidate whose *recursive* continuation is lex-best (more pairs
+        first, then lex-smaller).  This guarantees the globally lex-min
+        sequence.
 
-        self._material = material
-        self._update_text()
-    
+        Alpha-beta pruning: *upper_bound*, when given, is a continuation that
+        the result must strictly improve upon.  If we can determine at any
+        point that no improvement is possible, we return ``None`` (pruned)
+        instead of a list, so the caller can skip this branch immediately.
 
-    def set_material(self, material):
+        Simulation budget: when ``_sim_budget`` is exhausted (in simulation
+        mode only), the remaining positions are filled greedily.  This keeps
+        the worst-case runtime polynomial while producing exact results for
+        the vast majority of practical inputs.
 
-        if material is not None and rt.superClassOf(material) != rt.Material:
-            raise ValueError("The provided object is not a material.")
+        Args:
+            remaining: how many positions are still to be filled.
+            es: current starting index in edges_by_mv (skip pointer).
+            record: if not None, committed (i, j) pairs are appended here
+                    (real mode).  Always ``None`` during simulation.
+            upper_bound: if not None, prune when result cannot beat this.
+        Returns:
+            The lex-min continuation (list of min_val ints), or ``None`` if
+            pruned (result cannot beat *upper_bound*).
+        """
+        nonlocal cur_match_size, needed
 
-        if self._material == material:
-            self._update_text()
-            return
-        
-        self._material = material
-        self.material_changed.emit(material)
-        self._update_text()
+        # Budget check — only in simulation mode (record is None).
+        if record is None:
+            if _sim_budget[0] <= 0:
+                return _greedy_fill(remaining, es, None, upper_bound)
+            _sim_budget[0] -= 1
 
+        if remaining == 0:
+            # With upper_bound present we need a *strictly* better result;
+            # 0 remaining values can never improve on any bound.
+            return None if upper_bound is not None else []
 
-    def clear_material(self):
-        self.set_material(None)
+        needed = remaining - 1
 
+        # Advance past dead edges
+        while es < num_edges:
+            mv, i, j = edges_by_mv[es]
+            if not avail_a[i] or not avail_b[j]:
+                es += 1
+                continue
+            c = common_cnt[i][j]
+            if c > max_c_val or rd_arr[c] <= 0:
+                es += 1
+                continue
+            break
 
+        # Collect feasible edges at smallest min_val
+        feasible: list[tuple[int, int]] = []
+        best_mv = None
+        for eidx in range(es, num_edges):
+            mv, i, j = edges_by_mv[eidx]
+            if not avail_a[i] or not avail_b[j]:
+                continue
+            c = common_cnt[i][j]
+            if c > max_c_val or rd_arr[c] <= 0:
+                continue
+            if best_mv is not None and mv > best_mv:
+                break
+            if needed > 0 and not _is_feasible(i, j):
+                continue
+            if best_mv is None:
+                best_mv = mv
+            feasible.append((i, j))
 
-class TestWindow(QMainWindow):
-    def __init__(self, parent=MAX_WINDOW):
-        super().__init__(parent)
+        if not feasible:
+            return None if upper_bound is not None else []
 
-        self._layout = QVBoxLayout()
-        self._content = QWidget()
-        self._content.setLayout(self._layout)
-        self.setCentralWidget(self._content)
-        
-        map_button = MaterialButton()
-        map_button.clear_material()
+        # --- Alpha-beta pruning at this position ---
+        sub_bound = upper_bound          # bound to pass to deeper levels
+        if upper_bound is not None:
+            if not upper_bound:
+                # Bound is empty but we produce ≥1 value → strictly more pairs
+                # → we are already better; disable further pruning.
+                sub_bound = None
+            elif best_mv > upper_bound[0]:
+                # Our value at this position is strictly worse → prune.
+                return None
+            elif best_mv < upper_bound[0]:
+                # Strictly better already → no need to prune deeper.
+                sub_bound = None
+            else:
+                # Same value → continue comparing with rest of bound.
+                sub_bound = upper_bound[1:]
 
-        self._layout.addWidget(map_button)
+        # Single candidate — no tie to break
+        if len(feasible) == 1:
+            i_fix, j_fix = feasible[0]
+            _commit_edge(i_fix, j_fix)
+            if record is not None:
+                record.append((i_fix, j_fix))
+            sub = _select_greedy(remaining - 1, es, record, sub_bound)
+            if sub is None:
+                return None
+            return [best_mv] + sub
 
-        button = QPushButton("プリント")
-        
+        # Multiple candidates — recursively resolve the tie
+        save_ma = cur_ma[:]
+        save_mb = cur_mb[:]
+        save_ms = cur_match_size
+        save_aa = bytearray(avail_a)
+        save_ab = bytearray(avail_b)
+        save_rd = rd_arr[:]
 
-        def print_map():
-            print(map_button.material)
+        best_ij = feasible[0]
+        best_cont: list[int] | None = None
 
-        button.clicked.connect(print_map)
+        for i_try, j_try in feasible:
+            # Restore to pre-simulation state
+            cur_ma[:] = save_ma
+            cur_mb[:] = save_mb
+            cur_match_size = save_ms
+            avail_a[:] = save_aa
+            avail_b[:] = save_ab
+            rd_arr[:] = save_rd
 
-        self._layout.addWidget(button)
+            _commit_edge(i_try, j_try)
 
+            # Bound for this candidate: must beat current champion.
+            # For the first candidate (best_cont is None) use the inherited
+            # sub_bound from the parent; afterwards use best_cont which is
+            # at least as tight.
+            cand_bound = best_cont if best_cont is not None else sub_bound
+            cont = _select_greedy(remaining - 1, es, None, cand_bound)
 
-def main():
-    window = TestWindow()
-    window.show()
-    window.setFixedWidth(300)
+            if cont is None:
+                continue   # pruned — this candidate cannot beat current best
 
-if __name__ == "__main__":
-    main()
+            # Prefer: longer (more pairs) first, then lex-smaller
+            if (best_cont is None
+                    or len(cont) > len(best_cont)
+                    or (len(cont) == len(best_cont) and cont < best_cont)):
+                best_cont = cont
+                best_ij = (i_try, j_try)
+
+        # If no candidate survived pruning, propagate prune upward
+        if best_cont is None:
+            if upper_bound is not None:
+                return None
+            # Should not happen with a correct opt_adj, but be safe:
+            return []
+
+        # Restore state, commit the winner, then recurse for real
+        cur_ma[:] = save_ma
+        cur_mb[:] = save_mb
+        cur_match_size = save_ms
+        avail_a[:] = save_aa
+        avail_b[:] = save_ab
+        rd_arr[:] = save_rd
+
+        i_fix, j_fix = best_ij
+        _commit_edge(i_fix, j_fix)
+        if record is not None:
+            record.append((i_fix, j_fix))
+        return [best_mv] + _select_greedy(remaining - 1, es, record)
+
+    _sim_budget[0] = matched_count * 20
+    _select_greedy(matched_count, 0, fixed)
+
+    # Verify; fall back to original matching if needed
+    if len(fixed) == matched_count:
+        actual_cost = sum(edge_cost[i][j] for i, j in fixed)
+        if actual_cost != opt_total_cost:
+            fixed = [(i, match_a[i]) for i in range(n) if match_a[i] >= 0]
+    else:
+        fixed = [(i, match_a[i]) for i in range(n) if match_a[i] >= 0]
+
+    update_progress(95)
+
+    # Build output
+    paired = []
+    ua_set: set[int] = set()
+    ub_set: set[int] = set()
+    for i, j in fixed:
+        paired.append((data_a[keys_a[i]], data_b[keys_b[j]]))
+        ua_set.add(i)
+        ub_set.add(j)
+
+    unpaired_a = [data_a[keys_a[i]] for i in range(n) if i not in ua_set]
+    unpaired_b = [data_b[keys_b[j]] for j in range(m) if j not in ub_set]
+
+    update_progress(100)
+    return paired, unpaired_a, unpaired_b
